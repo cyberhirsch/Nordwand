@@ -103,6 +103,7 @@
 
 <div id="bar" class="panel">
   <span class="msg" id="status">STANDBY</span>
+  <button id="sunBtn">☀ SUN</button>
   <button id="alignBtn">⌖ ALIGN</button>
   <button id="menuBtn">SYS</button>
 </div>
@@ -152,7 +153,7 @@ let horizon=null, wx=null, sunEvt=null, target=null;
 const tiles=new Map();
 
 // ===== layer toggles =====
-const LAYERS={skyline:"SKYLINE",ridges:"RIDGES",grid:"GRID",ladder:"PITCH LADDER",peak:"PEAKS",hut:"HUTS",pass:"PASSES",lift:"LIFTS",sun:"SUN PATH",occluded:"OCCLUDED"};
+const LAYERS={skyline:"SKYLINE",ridges:"RIDGES",contours:"CONTOURS",grid:"GRID",ladder:"PITCH LADDER",peak:"PEAKS",hut:"HUTS",pass:"PASSES",lift:"LIFTS",sun:"SUN PATH",occluded:"OCCLUDED"};
 let on={}; try{on=JSON.parse(localStorage.getItem("hudLayers")||"{}")}catch(e){}
 for(const k in LAYERS){ if(on[k]==null) on[k]=k!=="occluded";
   const l=document.createElement("label");
@@ -240,23 +241,42 @@ async function loadTerrain(){
 
 // ===== horizon: skyline + layered ridgelines by distance band =====
 const BANDS=[0,6000,20000,60000,MAX_DIST];
+// Contours: per ray we record where the terrain crosses each CONTOUR_STEP level, keeping only
+// crossings that are not hidden by nearer terrain; adjacent rays are then stitched into segments.
+const CONTOUR_STEP=100, CONTOUR_MAX=45000;
 function computeHorizon(){
   const n=360/HZ_STEP, sky=new Float32Array(n), skyD=new Float32Array(n), ridges=BANDS.slice(1).map(()=>new Float32Array(n).fill(NaN));
-  const cosLat=Math.cos(rad(pos.lat));
+  const cross=[], cosLat=Math.cos(rad(pos.lat));
   for(let i=0;i<n;i++){
-    const az=rad(i*HZ_STEP),ca=Math.cos(az),sa=Math.sin(az);
-    let max=-90,maxD=0;
-    for(let d=150;d<MAX_DIST;d+=Math.max(90,d*0.012)){
+    const az=rad(i*HZ_STEP),ca=Math.cos(az),sa=Math.sin(az),cr=[];
+    let max=-90,maxD=0,pH=null,pA=0,pD=0;
+    for(let d=60;d<MAX_DIST;d+=d<6000?Math.max(25,d*0.01):Math.max(90,d*0.012)){
       const h=elevAt(pos.lat+d*ca/111320,pos.lon+d*sa/(111320*cosLat)); if(h==null) continue;
-      const a=elevAngle(h-pos.alt,d);
-      if(a>=max){ max=a; maxD=d;
+      const a=elevAngle(h-pos.alt,d), vis=a>=max;
+      if(pH!=null&&d<CONTOUR_MAX&&vis){
+        const l0=Math.floor(Math.min(pH,h)/CONTOUR_STEP)+1, l1=Math.floor(Math.max(pH,h)/CONTOUR_STEP);
+        for(let L=l0;L<=l1;L++){const t=(L*CONTOUR_STEP-pH)/(h-pH);cr.push(L,pA+(a-pA)*t,pD+(d-pD)*t)}
+      }
+      pH=h;pA=a;pD=d;
+      if(vis){ max=a; maxD=d;
         let b=0; while(d>=BANDS[b+1]) b++;
         if(!(ridges[b][i]>=a)) ridges[b][i]=a;
       }
     }
-    sky[i]=max; skyD[i]=maxD;
+    sky[i]=max; skyD[i]=maxD; cross.push(cr);
   }
-  return {sky,skyD,ridges};
+  // stitch: same level, similar distance on the neighbouring ray
+  const seg=[], segStart=new Int32Array(n+1);
+  for(let i=0;i<n;i++){
+    segStart[i]=seg.length/6; const A=cross[i],B=cross[(i+1)%n];
+    for(let j=0;j<A.length;j+=3){
+      let best=-1,bd=0.12;
+      for(let k=0;k<B.length;k+=3){ if(B[k]!==A[j]) continue; const r=Math.abs(B[k+2]-A[j+2])/A[j+2]; if(r<bd){bd=r;best=k} }
+      if(best>=0) seg.push(i*HZ_STEP,A[j+1],(i+1)*HZ_STEP,B[best+1],A[j],A[j+2]);
+    }
+  }
+  segStart[n]=seg.length/6;
+  return {sky,skyD,ridges,contours:new Float32Array(seg),segStart};
 }
 const hzAt=(arr,az)=>{const n=arr.length,f=((az%360)+360)%360/HZ_STEP,i=Math.floor(f)%n,j=(i+1)%n,t=f-Math.floor(f);return arr[i]*(1-t)+arr[j]*t};
 
@@ -435,6 +455,8 @@ function grabFrame(cw,ch){
     actx.fillStyle=g; actx.beginPath(); actx.moveTo(0,0);
     for(let x=0;x<=cw;x++){const az=fakeCam.h+(x-cw/2)/ppd;actx.lineTo(x,ch/2-(hzAt(horizon.sky,az)-fakeCam.p)*ppd)}
     actx.lineTo(cw,0); actx.fill();
+    if(pos){const sp=sunPos(Date.now(),pos.lat,pos.lon),sx=cw/2+wrap(sp.az-fakeCam.h)*ppd,sy=ch/2-(sp.alt-fakeCam.p)*ppd;
+      actx.fillStyle="#fff";actx.beginPath();actx.arc(sx,sy,Math.max(1.5,ppd*0.6),0,7);actx.fill()}
     for(let i=0;i<cw*ch/6;i++){actx.fillStyle=`rgba(${Math.random()*80|0},${Math.random()*80|0},${Math.random()*80|0},.25)`;actx.fillRect(Math.random()*cw,Math.random()*ch,1,1)}
   } else {
     const v=$("cam"); if(!v.videoWidth) return null;
@@ -512,6 +534,27 @@ setInterval(()=>{ if(!fakeCam||!horizon) return;
   document.body.style.background=`url(${acv.toDataURL()}) center/cover`; $("cam").style.display="none";
 },1000);
 
+// ===== ☀ SUN calibration =====
+// Finds the sun (largest saturated blob) in the camera image; its angular offset from the
+// screen centre plus the computed solar azimuth/altitude gives an absolute heading + pitch.
+// Falls back to "sun is under the reticle" if no blob is found.
+function findSunInFrame(){
+  const cw=96,ch=Math.max(48,Math.round(cw*innerHeight/innerWidth)),d=grabFrame(cw,ch); if(!d) return null;
+  let sx=0,sy=0,n=0;
+  for(let y=0;y<ch;y++)for(let x=0;x<cw;x++){const i=(y*cw+x)*4; if(d[i]>250&&d[i+1]>245&&d[i+2]>235){sx+=x;sy+=y;n++}}
+  if(n<2||n>cw*ch*0.08) return null; // nothing, or a blown-out sky/snowfield
+  const ppd=ch/+$("fov").value,px=(sx/n+0.5-cw/2)/ppd,py=-(sy/n+0.5-ch/2)/ppd,cr=Math.cos(rad(-roll)),sr=Math.sin(rad(-roll));
+  return {dx:px*cr-py*sr,de:px*sr+py*cr};
+}
+$("sunBtn").onclick=()=>{
+  if(!pos) return status("SUN CAL: NO POSITION");
+  const sp=sunPos(Date.now(),pos.lat,pos.lon);
+  if(sp.alt<1) return status("SUN CAL: SUN BELOW HORIZON");
+  const f=findSunInFrame()||{dx:0,de:0,reticle:true};
+  AL.h+=wrap(sp.az-(curHead()+f.dx)); AL.p+=sp.alt-(curPit()+f.de);
+  status(`SUN CAL ${f.reticle?"(RETICLE)":"(DETECTED)"} · AZ ${sp.az.toFixed(1)}° · EL ${sp.alt.toFixed(1)}° · HDG ${curHead().toFixed(1)}°`);
+};
+
 // ===== render =====
 const cv=$("ov"),ctx=cv.getContext("2d");
 function resize(){cv.width=innerWidth*devicePixelRatio;cv.height=innerHeight*devicePixelRatio}
@@ -559,6 +602,22 @@ function draw(){
       if(fill){ctx.lineTo(P(a1,0)[0],H);ctx.lineTo(P(a0,0)[0],H);ctx.closePath();ctx.fillStyle=fill;ctx.fill()}
       ctx.strokeStyle=style; ctx.lineWidth=lw; ctx.stroke();
     };
+    if(on.contours&&horizon.contours){
+      const C=horizon.contours,S=horizon.segStart,nr=S.length-1,paths=[[],[],[],[]];
+      const i0=Math.floor(((a0%360)+360)%360/HZ_STEP),cnt=Math.ceil((a1-a0)/HZ_STEP);
+      for(let k=0;k<cnt;k++){
+        const i=(i0+k)%nr;
+        for(let q=S[i];q<S[i+1];q++){
+          const o=q*6,major=C[o+4]%5===0,b=C[o+5]<4000?0:C[o+5]<15000?1:2;
+          const [x1,y1]=P(C[o],C[o+1]),[x2,y2]=P(C[o+2],C[o+3]);
+          (major?paths[3]:paths[b]).push(x1,y1,x2,y2);
+        }
+      }
+      const st=["rgba(62,242,255,.7)","rgba(62,242,255,.45)","rgba(62,242,255,.25)","rgba(255,181,71,.8)"];
+      paths.forEach((pp,j)=>{ if(!pp.length) return; ctx.beginPath();
+        for(let m=0;m<pp.length;m+=4){ctx.moveTo(pp[m],pp[m+1]);ctx.lineTo(pp[m+2],pp[m+3])}
+        ctx.strokeStyle=st[j]; ctx.lineWidth=(j===3?1.1:0.8)*s; ctx.stroke(); });
+    }
     if(on.ridges){
       const st=["rgba(62,242,255,.75)","rgba(62,242,255,.5)","rgba(62,242,255,.32)","rgba(62,242,255,.2)"];
       for(let b=horizon.ridges.length-1;b>=0;b--) line(horizon.ridges[b],st[b],(1.6-b*0.3)*s);
