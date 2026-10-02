@@ -143,6 +143,7 @@ const R=6371000, K_REFR=0.13, MAX_DIST=180000, Z=9, HZ_STEP=0.5;
 const rad=d=>d*Math.PI/180, deg=r=>r*180/Math.PI, $=id=>document.getElementById(id);
 const wrap=d=>((d%360)+540)%360-180;
 const COL={peak:"#3ef2ff",hut:"#7dff9b",pass:"#d48bff",lift:"#e8fdff",sun:"#ffb547",lock:"#ff4d6d"};
+const label=p=>p.name||`P. ${Math.round(p.ele)}`;
 const TYPE_LBL={peak:"SUMMIT",hut:"HUT",pass:"COL/PASS",lift:"LIFT STN"};
 
 let pos=null, heading=0, pitch=0, roll=0, iosHeading=null, lastCalcPos=null;
@@ -182,8 +183,10 @@ function loadTile(x,y){
       const d=g.getImageData(0,0,256,256).data,h=new Float32Array(65536);
       for(let i=0;i<65536;i++) h[i]=d[i*4]*256+d[i*4+1]+d[i*4+2]/256-32768;
       tiles.set(key,h);res(h)};
-    img.onerror=()=>{tiles.set(key,null);res(null)};
-    img.src=`https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${Z}/${x}/${y}.png`;
+    // bundled offline tiles first, AWS only if the tile isn't in the bundle
+    img.onerror=()=>{ if(img.dataset.remote){tiles.set(key,null);res(null);return}
+      img.dataset.remote=1; img.src=`https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${Z}/${x}/${y}.png`; };
+    img.src=`tiles/${Z}/${x}/${y}.png`;
   });
   tiles.set(key,p); return p;
 }
@@ -265,7 +268,7 @@ async function loadOSM(){
       if(Math.abs(lat-pos.lat)>0.6||Math.abs(lon-pos.lon)>0.9) continue;
       if(bearingDist(pos.lat,pos.lon,lat,lon)[1]>POI_RANGE[type]) continue;
       if(type==="peak"&&pois.some(p=>p.major&&Math.abs(p.lat-lat)<0.005&&Math.abs(p.lon-lon)<0.007)) continue;
-      pois.push({name,lat,lon,ele,type,major:false}); added++;
+      pois.push({name:name||null,lat,lon,ele,type,major:false}); added++;
     }
     if(horizon) recompute();
     status(`OFFLINE DB +${added} POI`); return;
@@ -335,8 +338,11 @@ const hhmm=t=>new Date(t).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit
 // Orientation sources, best first: Generic Sensor API (Android) > deviceorientationabsolute > deviceorientation (+iOS compass).
 // All feed applyRot() with the device->world (ENU) rotation matrix entries we need.
 const sens={src:"NONE",n:0,last:0,absAt:0};
+const SRC_RANK={NATIVE:5,SENSOR:4,"ABS-EVT":3,"IOS-CMP":3,"REL-EVT":1};
 function applyRot(r13,r23,r33,r31,r32,src){
-  sens.src=src; sens.n++; sens.last=performance.now();
+  const now=performance.now();
+  if(SRC_RANK[src]<(SRC_RANK[sens.src]||0)&&now-sens.last<500) return; // a better source is live
+  sens.src=src; sens.n++; sens.last=now;
   const h=(deg(Math.atan2(-r13,-r23))+360)%360;
   heading=(heading+wrap(h-heading)*0.2+360)%360;
   pitch+=(deg(Math.asin(Math.max(-1,Math.min(1,-r33))))-pitch)*0.2;
@@ -347,7 +353,6 @@ function onOrient(e,abs){
   const now=performance.now();
   if(abs||e.absolute) sens.absAt=now;
   else if(e.webkitCompassHeading==null&&now-sens.absAt<1000) return; // prefer absolute stream
-  if(sens.src==="SENSOR"&&now-sens.last<500) return;                 // generic sensor is running
   if(e.webkitCompassHeading!=null) iosHeading=e.webkitCompassHeading;
   let a=e.alpha??0; if(iosHeading!=null) a=360-iosHeading;
   a=rad(a); const b=rad(e.beta||0),g=rad(e.gamma||0);
@@ -356,6 +361,13 @@ function onOrient(e,abs){
     iosHeading!=null?"IOS-CMP":(abs||e.absolute)?"ABS-EVT":"REL-EVT");
 }
 function startSensors(){
+  // native app (Capacitor): fused rotation-vector sensor straight from Android/iOS
+  const C=window.Capacitor;
+  if(C?.isNativePlatform?.()){
+    const NS=C.registerPlugin("NordSensor");
+    NS.addListener("rot",d=>{const m=d.m;applyRot(m[2],m[5],m[8],m[6],m[7],"NATIVE")});
+    NS.start().catch(e=>status("NATIVE SENSOR: "+e.message));
+  }
   if("AbsoluteOrientationSensor" in window){
     try{
       const s=new AbsoluteOrientationSensor({frequency:30,referenceFrame:"device"});
@@ -560,7 +572,7 @@ function draw(){
   // POIs
   target=null;
   if(pos&&horizon){
-    const pri=p=>(p.major?1e6:0)+(p.type==="peak"?p.ele:p.type==="hut"?3000:2000)-p.dist/50;
+    const pri=p=>(p.major?1e6:0)+(p.type==="peak"?p.ele:p.type==="hut"?3000:2000)-p.dist/50-(p.name?0:2500);
     const items=pois.filter(p=>p.dist<MAX_DIST&&on[p.type]&&(p.vis||on.occluded)&&Math.abs(wrap(p.brg-head))<hfov*0.6)
       .map(p=>{const [x,y]=P(p.brg,p.angle);return {p,x,y}}).sort((a,b)=>pri(b.p)-pri(a.p));
     // target = visible POI closest to reticle
@@ -579,7 +591,8 @@ function draw(){
       else ctx.arc(x,y,m,0,7);
       ctx.stroke();
       if(labels>=28) continue;
-      const name=p.name.toUpperCase(),sub=`${Math.round(p.ele)}M  ${(p.dist/1000).toFixed(1)}KM`;
+      if(!p.name&&p.dist>12000&&it!==target) continue; // spot heights only nearby
+      const name=label(p).toUpperCase(),sub=`${Math.round(p.ele)}M  ${(p.dist/1000).toFixed(1)}KM`;
       ctx.font=F(700,p.major?11:10); const w=Math.max(ctx.measureText(name).width,ctx.measureText(sub).width*0.85)+14*s, bh=28*s;
       let ly=y-(p.major?56:38)*s, tries=0;
       while(tries<5&&placed.some(q=>Math.abs(q.x-x)<(q.w+w)/2+4*s&&Math.abs(q.y-ly)<bh+4*s)){ly-=bh+6*s;tries++}
@@ -677,7 +690,7 @@ setInterval(()=>{
   const L=$("lock");
   if(target){
     const p=target.p; L.style.display="block";
-    $("lType").textContent=TYPE_LBL[p.type]; $("lName").textContent=p.name;
+    $("lType").textContent=TYPE_LBL[p.type]; $("lName").textContent=label(p);
     $("lEle").textContent=`${Math.round(p.ele)} M`; $("lDst").textContent=`${(p.dist/1000).toFixed(2)} KM`;
     $("lBrg").textContent=`${p.brg.toFixed(1)}° ${cardinal(p.brg)}`;
     const dh=p.ele-pos.alt; $("lDh").textContent=`${dh>0?"+":""}${Math.round(dh)} M`;

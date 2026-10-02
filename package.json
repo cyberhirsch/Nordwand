@@ -1,0 +1,19 @@
+{
+  "name": "nordwand",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Alpine terrain-aware AR orientation system",
+  "scripts": {
+    "sync": "cap sync",
+    "android": "cap run android",
+    "pois": "python3 tools/build_pois_pbf.py",
+    "dem": "python3 tools/fetch_dem.py"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.2",
+    "@capacitor/core": "^8.5.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.2"
+  }
+}
