@@ -55,7 +55,7 @@
   <div class="ring"></div>
   <h1>NORDWAND</h1>
   <div class="sub">ALPINE TERRAIN-AWARE ORIENTATION SYSTEM // v2</div>
-  <div class="dim" style="max-width:320px">REQUIRES CAMERA · GNSS · MOTION SENSORS<br>DATA: AWS TERRAIN · OPENSTREETMAP · OPEN-METEO</div>
+  <div class="dim" style="max-width:320px">REQUIRES CAMERA · GNSS · MOTION SENSORS<br>DATA: AWS TERRAIN · © BAYER. VERMESSUNGSVERWALTUNG (CC BY 4.0) · © OPENSTREETMAP · OPEN-METEO</div>
   <button id="go">[ INITIALISE ]</button>
 </div>
 <video id="cam" autoplay playsinline muted></video>
@@ -190,7 +190,41 @@ function loadTile(x,y){
   });
   tiles.set(key,p); return p;
 }
+// ---- HD terrain packs (docs/packs/<id>/13/x/y.png, transparent = no data) ----
+const hdTiles=new Map(); let hdZ=null, hdPacks=[];
+function loadHdTile(z,x,y,base){
+  const key=`${z}/${x}/${y}`; if(hdTiles.has(key)) return hdTiles.get(key);
+  const p=new Promise(res=>{
+    const img=new Image();
+    img.onload=()=>{const c=document.createElement("canvas");c.width=c.height=256;const g=c.getContext("2d");g.drawImage(img,0,0);
+      const d=g.getImageData(0,0,256,256).data,h=new Float32Array(65536);
+      for(let i=0;i<65536;i++) h[i]=d[i*4+3]<128?NaN:d[i*4]*256+d[i*4+1]+d[i*4+2]/256-32768;
+      hdTiles.set(key,h);res(h)};
+    img.onerror=()=>{hdTiles.set(key,null);res(null)};
+    img.src=`${base}/${z}/${x}/${y}.png`;
+  });
+  hdTiles.set(key,p); return p;
+}
+async function loadHdPacks(radius=30000){
+  let idx=[]; try{idx=await (await fetch("packs/index.json")).json()}catch(e){return}
+  const tileJobs=[];
+  for(const pk of idx){
+    const [s,w,n,e]=pk.bbox, mLat=radius/111000, mLon=mLat/Math.cos(rad(pos.lat));
+    if(pos.lat<s-mLat||pos.lat>n+mLat||pos.lon<w-mLon||pos.lon>e+mLon) continue;
+    const man=await (await fetch(`packs/${pk.id}/pack.json`)).json(); hdZ=man.z; hdPacks.push(man);
+    for(const [x,y] of man.tiles){
+      const n2=2**man.z, lon=(x+.5)/n2*360-180, lat=deg(Math.atan(Math.sinh(Math.PI*(1-2*(y+.5)/n2))));
+      if(bearingDist(pos.lat,pos.lon,lat,lon)[1]<radius) tileJobs.push(loadHdTile(man.z,x,y,`packs/${pk.id}`));
+    }
+  }
+  await Promise.all(tileJobs);
+  if(hdPacks.length) status(`HD PACK ${hdPacks.map(p=>p.title.toUpperCase()).join(", ")} · ${tileJobs.length} TILES`);
+}
 function elevAt(lat,lon){
+  if(hdZ){
+    const [fx,fy]=tileXY(lat,lon,hdZ),x=Math.floor(fx),y=Math.floor(fy),t=hdTiles.get(`${hdZ}/${x}/${y}`);
+    if(t instanceof Float32Array){const v=t[Math.min(255,Math.floor((fy-y)*256))*256+Math.min(255,Math.floor((fx-x)*256))]; if(!isNaN(v)) return v}
+  }
   const [fx,fy]=tileXY(lat,lon,Z),x=Math.floor(fx),y=Math.floor(fy),t=tiles.get(`${x}/${y}`);
   if(!(t instanceof Float32Array)) return null;
   return t[Math.min(255,Math.floor((fy-y)*256))*256+Math.min(255,Math.floor((fx-x)*256))];
@@ -200,7 +234,7 @@ async function loadTerrain(){
   const [x0,y0]=tileXY(pos.lat+dLat,pos.lon-dLon,Z),[x1,y1]=tileXY(pos.lat-dLat,pos.lon+dLon,Z),jobs=[];
   for(let x=Math.floor(x0);x<=Math.floor(x1);x++)for(let y=Math.floor(y0);y<=Math.floor(y1);y++) jobs.push(loadTile(x,y));
   let done=0; jobs.forEach(j=>j.then(()=>status(`DEM STREAM ${++done}/${jobs.length} TILES`)));
-  await Promise.all(jobs);
+  await Promise.all([...jobs, loadHdPacks()]);
   recompute();
 }
 

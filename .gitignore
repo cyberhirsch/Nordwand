@@ -2,3 +2,4 @@ tools/.cache/
 .DS_Store
 tools/data/
 node_modules/
+tools/.venv/
