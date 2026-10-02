@@ -103,6 +103,7 @@
 
 <div id="bar" class="panel">
   <span class="msg" id="status">STANDBY</span>
+  <button id="alignBtn">⌖ ALIGN</button>
   <button id="menuBtn">SYS</button>
 </div>
 
@@ -369,6 +370,102 @@ function startSensors(){
   setTimeout(()=>{if(!sens.n) status("NO ORIENTATION DATA · CHROME › SITE SETTINGS › MOTION SENSORS = ALLOW")},3000);
 }
 
+// ===== ⌖ ALIGN: skyline matching =====
+// Detects the sky/terrain edge in the camera image, slides it along the DEM skyline (360°)
+// and solves heading + pitch. Result is stored as an offset on top of the sensors, so it
+// also works with no sensors at all (heading/pitch stay 0 → offset becomes absolute).
+const AL={h:0,p:0,track:false,pts:null,cost:null,conf:null,lost:0};
+let fakeCam=null; // desktop sim: ?fake=1 renders a synthetic camera image from the DEM
+const curHead=()=>(heading+ +$("off").value+AL.h+720)%360, curPit=()=>pitch+ +$("poff").value+AL.p;
+const acv=document.createElement("canvas"),actx=acv.getContext("2d",{willReadFrequently:true});
+
+function grabFrame(cw,ch){
+  acv.width=cw; acv.height=ch;
+  if(fakeCam){
+    if(!horizon) return null;
+    const vfov=+$("fov").value,ppd=ch/vfov;
+    actx.fillStyle="#2a2f33"; actx.fillRect(0,0,cw,ch);
+    const g=actx.createLinearGradient(0,0,0,ch); g.addColorStop(0,"#5b8fd6"); g.addColorStop(1,"#cfe3f5");
+    actx.fillStyle=g; actx.beginPath(); actx.moveTo(0,0);
+    for(let x=0;x<=cw;x++){const az=fakeCam.h+(x-cw/2)/ppd;actx.lineTo(x,ch/2-(hzAt(horizon.sky,az)-fakeCam.p)*ppd)}
+    actx.lineTo(cw,0); actx.fill();
+    for(let i=0;i<cw*ch/6;i++){actx.fillStyle=`rgba(${Math.random()*80|0},${Math.random()*80|0},${Math.random()*80|0},.25)`;actx.fillRect(Math.random()*cw,Math.random()*ch,1,1)}
+  } else {
+    const v=$("cam"); if(!v.videoWidth) return null;
+    const sc=Math.max(innerWidth/v.videoWidth,innerHeight/v.videoHeight),sw=innerWidth/sc,sh=innerHeight/sc;
+    actx.drawImage(v,(v.videoWidth-sw)/2,(v.videoHeight-sh)/2,sw,sh,0,0,cw,ch);
+  }
+  return actx.getImageData(0,0,cw,ch).data;
+}
+// per column: best brightness split (Otsu-style) → sky/terrain boundary row
+function detectSkyline(){
+  const cw=96,ch=Math.max(48,Math.round(cw*innerHeight/innerWidth)),d=grabFrame(cw,ch); if(!d) return null;
+  const vfov=+$("fov").value,ppd=ch/vfov,cr=Math.cos(rad(-roll)),sr=Math.sin(rad(-roll));
+  const ys=new Array(cw).fill(null),pre=new Float32Array(ch+1);
+  for(let x=0;x<cw;x++){
+    for(let y=0;y<ch;y++){const i=(y*cw+x)*4;pre[y+1]=pre[y]+(d[i]*.3+d[i+1]*.5+d[i+2]*.2)+0.4*(d[i+2]-d[i])}
+    const tot=pre[ch]; let best=0,by=-1;
+    for(let y=Math.round(ch*.04);y<ch*.96;y++){
+      const a=pre[y]/y,b=(tot-pre[y])/(ch-y),sc=(a-b)*Math.sqrt(y*(ch-y))/ch;
+      if(sc>best){best=sc;by=y}
+    }
+    if(best>14) ys[x]=by;
+  }
+  // light median filter, then convert to angles in the overlay (roll-corrected) frame
+  const pts=[];
+  for(let x=1;x<cw-1;x++){
+    const w=[ys[x-1],ys[x],ys[x+1]].filter(v=>v!=null); if(w.length<2||ys[x]==null) continue;
+    const y=w.sort((a,b)=>a-b)[w.length>>1];
+    const px=(x+0.5-cw/2)/ppd,py=-(y+0.5-ch/2)/ppd; // degrees from centre, screen frame
+    pts.push({dx:px*cr-py*sr,e:px*sr+py*cr,sx:(x+0.5)/cw,sy:(y+0.5)/ch});
+  }
+  return pts.length>cw*0.35?pts:null;
+}
+function matchCost(pts,h){
+  const r=pts.map(p=>hzAt(horizon.sky,h+p.dx)-p.e).sort((a,b)=>a-b),v=r[r.length>>1];
+  let c=0; for(const x of r) c+=Math.abs(x-v); return [c/r.length,v];
+}
+function matchSkyline(pts,center,half){
+  let best={c:1e9},costs=[];
+  for(let h=center-half;h<=center+half;h+=1){const [c,v]=matchCost(pts,h);costs.push([h,c]);if(c<best.c)best={h,c,v}}
+  for(let h=best.h-1.5;h<=best.h+1.5;h+=0.1){const [c,v]=matchCost(pts,h);if(c<best.c)best={h,c,v}}
+  // ambiguity: best cost outside ±8° of the winner
+  const alt=Math.min(...costs.filter(([h])=>Math.abs(wrap(h-best.h))>8).map(([,c])=>c),1e9);
+  best.conf=alt/Math.max(best.c,0.05);
+  best.h=(best.h+720)%360; return best;
+}
+function runAlign(full){
+  if(!horizon) return status("ALIGN: TERRAIN NOT READY");
+  const pts=detectSkyline(); AL.pts=pts;
+  if(!pts){ if(full) status("ALIGN: NO SKYLINE IN VIEW"); AL.lost++; return false }
+  const m=matchSkyline(pts,curHead(),full?180:6);
+  AL.cost=m.c; AL.conf=m.conf;
+  const ok=m.c<0.8&&(!full||m.conf>1.35);
+  if(!ok){ if(full) status(`ALIGN: AMBIGUOUS (ERR ${m.c.toFixed(2)}° · CONF ${m.conf.toFixed(1)})`); AL.lost++; return false }
+  const k=full?1:0.35; // smooth while tracking
+  AL.h+=wrap(m.h-curHead())*k; AL.p+=(m.v-curPit())*k; AL.lost=0;
+  if(full) status(`ALIGNED · HDG ${m.h.toFixed(1)}° · ERR ${m.c.toFixed(2)}° · CONF ${m.conf.toFixed(1)}`);
+  return true;
+}
+$("alignBtn").onclick=()=>{
+  if(AL.track){AL.track=false;AL.pts=null;$("alignBtn").textContent="⌖ ALIGN";status("TRACKING OFF · OFFSET KEPT");return}
+  if(runAlign(true)){AL.track=true;$("alignBtn").textContent="⌖ TRK"}
+};
+setInterval(()=>{ if(!AL.track) return;
+  runAlign(false);
+  if(AL.lost>15){ if(runAlign(true)) AL.lost=0; } // re-acquire with full search
+},200);
+function drawCamSkyline(W,H,s){
+  if(!AL.pts||!AL.track&&!AL.pts) return;
+  ctx.fillStyle=AL.lost?"rgba(255,77,109,.8)":"rgba(255,181,71,.85)";
+  for(const p of AL.pts) ctx.fillRect(p.sx*W-1.5*s,p.sy*H-1.5*s,3*s,3*s);
+}
+// fake camera shows behind the HUD in sim mode
+setInterval(()=>{ if(!fakeCam||!horizon) return;
+  grabFrame(192,Math.round(192*innerHeight/innerWidth));
+  document.body.style.background=`url(${acv.toDataURL()}) center/cover`; $("cam").style.display="none";
+},1000);
+
 // ===== render =====
 const cv=$("ov"),ctx=cv.getContext("2d");
 function resize(){cv.width=innerWidth*devicePixelRatio;cv.height=innerHeight*devicePixelRatio}
@@ -380,7 +477,7 @@ function draw(){
   const W=cv.width,H=cv.height,s=devicePixelRatio,t=performance.now();
   ctx.clearRect(0,0,W,H);
   const vfov=+$("fov").value,ppd=H/vfov,hfov=W/ppd;
-  const head=(heading+ +$("off").value+360)%360,pit=pitch+ +$("poff").value;
+  const head=curHead(),pit=curPit();
   const P=(az,el)=>[wrap(az-head)*ppd,-(el-pit)*ppd]; // relative to centre, roll-frame
 
   ctx.save(); ctx.translate(W/2,H/2); ctx.rotate(rad(roll));
@@ -511,6 +608,7 @@ function draw(){
   ctx.restore();
 
   drawTape(W,H,s,head,hfov,ppd);
+  drawCamSkyline(W,H,s);
   drawReticle(W,H,s,t);
   if(!pos){ctx.font=F(700,13);ctx.fillStyle=COL.lock;ctx.textAlign="center";if((t/500|0)%2)ctx.fillText("ACQUIRING GNSS FIX",W/2,H/2+60*s)}
 }
@@ -559,9 +657,9 @@ function drawReticle(W,H,s,t){
 // ===== DOM telemetry @ 5 Hz =====
 const status=t=>$("status").textContent="> "+t;
 setInterval(()=>{
-  const head=(heading+ +$("off").value+360)%360;
+  const head=curHead();
   $("tHdg").textContent=`${head.toFixed(1)}° ${cardinal(head)}`;
-  $("tPit").textContent=`${(pitch+ +$("poff").value).toFixed(1)}°`;
+  $("tPit").textContent=`${curPit().toFixed(1)}°`;
   $("tRol").textContent=`${roll.toFixed(1)}°`;
   $("tUtc").textContent=new Date().toISOString().slice(11,19);
   $("tSen").textContent=`${sens.src} ${sens.n}`;
@@ -607,7 +705,7 @@ $("go").onclick=async()=>{
 };
 // desktop sim: ?lat=45.983&lon=7.785&h=250&p=2
 const q=new URLSearchParams(location.search);
-if(q.has("lat")){heading=+(q.get("h")||0);pitch=+(q.get("p")||0);$("start").remove();setPos(+q.get("lat"),+q.get("lon"),null,null);draw()}
+if(q.has("lat")){heading=+(q.get("h")||0)+ +(q.get("err")||0);pitch=+(q.get("p")||0);if(q.has("fake")) fakeCam={h:+(q.get("h")||0),p:+(q.get("p")||0)};$("start").remove();setPos(+q.get("lat"),+q.get("lon"),null,null);draw()}
 </script>
 </body>
 </html>
