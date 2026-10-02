@@ -72,6 +72,7 @@
   <div class="row"><span>PITCH</span><b id="tPit">—</b></div>
   <div class="row"><span>ROLL</span><b id="tRol">—</b></div>
   <div class="row"><span>UTC</span><b id="tUtc">—</b></div>
+  <div class="row"><span>SENS</span><b id="tSen">—</b></div>
 </div>
 
 <div id="env" class="panel">
@@ -330,17 +331,42 @@ function sunEvents(){
 const hhmm=t=>new Date(t).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
 
 // ===== orientation =====
-function onOrient(e){
+// Orientation sources, best first: Generic Sensor API (Android) > deviceorientationabsolute > deviceorientation (+iOS compass).
+// All feed applyRot() with the device->world (ENU) rotation matrix entries we need.
+const sens={src:"NONE",n:0,last:0,absAt:0};
+function applyRot(r13,r23,r33,r31,r32,src){
+  sens.src=src; sens.n++; sens.last=performance.now();
+  const h=(deg(Math.atan2(-r13,-r23))+360)%360;
+  heading=(heading+wrap(h-heading)*0.2+360)%360;
+  pitch+=(deg(Math.asin(Math.max(-1,Math.min(1,-r33))))-pitch)*0.2;
+  roll+=wrap(deg(Math.atan2(r31,r32))-roll)*0.2;
+}
+function onOrient(e,abs){
+  if(e.alpha==null&&e.webkitCompassHeading==null) return;
+  const now=performance.now();
+  if(abs||e.absolute) sens.absAt=now;
+  else if(e.webkitCompassHeading==null&&now-sens.absAt<1000) return; // prefer absolute stream
+  if(sens.src==="SENSOR"&&now-sens.last<500) return;                 // generic sensor is running
   if(e.webkitCompassHeading!=null) iosHeading=e.webkitCompassHeading;
-  let a=e.alpha; if(a==null) return;
-  if(iosHeading!=null) a=360-iosHeading;
+  let a=e.alpha??0; if(iosHeading!=null) a=360-iosHeading;
   a=rad(a); const b=rad(e.beta||0),g=rad(e.gamma||0);
   const ca=Math.cos(a),sa=Math.sin(a),cb=Math.cos(b),sb=Math.sin(b),cg=Math.cos(g),sg=Math.sin(g);
-  const ex=-(ca*sg+sa*sb*cg),ny=-(sa*sg-ca*sb*cg),up=-(cb*cg);
-  const h=(deg(Math.atan2(ex,ny))+360)%360;
-  heading=(heading+wrap(h-heading)*0.2+360)%360;
-  pitch+=(deg(Math.asin(Math.max(-1,Math.min(1,up))))-pitch)*0.2;
-  const r=deg(Math.atan2(-cb*sg,sb)); roll+=wrap(r-roll)*0.2;
+  applyRot(ca*sg+sa*sb*cg, sa*sg-ca*sb*cg, cb*cg, -cb*sg, sb,
+    iosHeading!=null?"IOS-CMP":(abs||e.absolute)?"ABS-EVT":"REL-EVT");
+}
+function startSensors(){
+  if("AbsoluteOrientationSensor" in window){
+    try{
+      const s=new AbsoluteOrientationSensor({frequency:30,referenceFrame:"device"});
+      s.onreading=()=>{const [x,y,z,w]=s.quaternion;
+        applyRot(2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y),2*(x*z-w*y),2*(y*z+w*x),"SENSOR")};
+      s.onerror=e=>status("SENSOR API: "+e.error.name);
+      s.start();
+    }catch(e){}
+  }
+  addEventListener("deviceorientationabsolute",e=>onOrient(e,true));
+  addEventListener("deviceorientation",e=>onOrient(e,false));
+  setTimeout(()=>{if(!sens.n) status("NO ORIENTATION DATA · CHROME › SITE SETTINGS › MOTION SENSORS = ALLOW")},3000);
 }
 
 // ===== render =====
@@ -538,6 +564,7 @@ setInterval(()=>{
   $("tPit").textContent=`${(pitch+ +$("poff").value).toFixed(1)}°`;
   $("tRol").textContent=`${roll.toFixed(1)}°`;
   $("tUtc").textContent=new Date().toISOString().slice(11,19);
+  $("tSen").textContent=`${sens.src} ${sens.n}`;
   if(pos){
     $("tLat").textContent=`${Math.abs(pos.lat).toFixed(5)}°${pos.lat>=0?"N":"S"}`;
     $("tLon").textContent=`${Math.abs(pos.lon).toFixed(5)}°${pos.lon>=0?"E":"W"}`;
@@ -570,7 +597,7 @@ function setPos(lat,lon,gpsAlt,acc){
 }
 $("go").onclick=async()=>{
   try{if(typeof DeviceOrientationEvent!=="undefined"&&DeviceOrientationEvent.requestPermission) await DeviceOrientationEvent.requestPermission()}catch(e){}
-  addEventListener("ondeviceorientationabsolute" in window?"deviceorientationabsolute":"deviceorientation",onOrient);
+  startSensors();
   try{$("cam").srcObject=await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"},audio:false})}
   catch(e){status("CAMERA OFFLINE: "+e.message)}
   $("start").remove();
