@@ -14,56 +14,52 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 /**
- * Streams the fused rotation-vector sensor to the web layer as a device->world (East, North, Up)
- * rotation matrix, row-major. Bypasses the WebView's DeviceOrientation API entirely.
+ * Two orientation streams, each as a device->world rotation matrix (row-major 3x3):
+ *  "game" - GAME_ROTATION_VECTOR (gyro + accel, no magnetometer): smooth, immune to magnetic
+ *           disturbance, arbitrary yaw origin. Drives the HUD.
+ *  "rot"  - ROTATION_VECTOR (adds magnetometer): absolute north. Used only for the first guess
+ *           and as a slow backup when no skyline/sun fix is available.
  */
 @CapacitorPlugin(name = "NordSensor")
 public class NordSensorPlugin extends Plugin implements SensorEventListener {
     private SensorManager sm;
-    private final float[] rot = new float[9];
-    private long lastEmit = 0;
-    private int accuracy = -1;
+    private Sensor game, rot;
+    private final float[] m = new float[9];
+    private long lastGame = 0, lastRot = 0;
 
     @PluginMethod
     public void start(PluginCall call) {
         sm = (SensorManager) getContext().getSystemService(Context.SENSOR_SERVICE);
-        Sensor s = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
-        String type = "ROTVEC";
-        if (s == null) { s = sm.getDefaultSensor(Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR); type = "GEOROT"; }
-        if (s == null) { call.reject("No rotation sensor on this device"); return; }
-        sm.unregisterListener(this);
-        sm.registerListener(this, s, SensorManager.SENSOR_DELAY_GAME);
-        JSObject r = new JSObject(); r.put("sensor", type); call.resolve(r);
+        game = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
+        rot = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+        if (game == null && rot == null) { call.reject("No rotation sensors on this device"); return; }
+        register();
+        JSObject r = new JSObject(); r.put("game", game != null); r.put("compass", rot != null); call.resolve(r);
     }
 
     @PluginMethod
-    public void stop(PluginCall call) {
-        if (sm != null) sm.unregisterListener(this);
-        call.resolve();
+    public void stop(PluginCall call) { if (sm != null) sm.unregisterListener(this); call.resolve(); }
+
+    private void register() {
+        sm.unregisterListener(this);
+        if (game != null) sm.registerListener(this, game, SensorManager.SENSOR_DELAY_GAME);
+        if (rot != null) sm.registerListener(this, rot, SensorManager.SENSOR_DELAY_UI);
     }
 
     @Override
     public void onSensorChanged(SensorEvent e) {
         long now = System.currentTimeMillis();
-        if (now - lastEmit < 25) return; // ~40 Hz is plenty for the HUD
-        lastEmit = now;
-        SensorManager.getRotationMatrixFromVector(rot, e.values);
-        JSArray m = new JSArray();
-        for (float v : rot) m.put((double) v);
-        JSObject d = new JSObject(); d.put("m", m); d.put("acc", accuracy);
-        notifyListeners("rot", d);
+        boolean isGame = e.sensor.getType() == Sensor.TYPE_GAME_ROTATION_VECTOR;
+        if (isGame) { if (now - lastGame < 20) return; lastGame = now; }   // ~50 Hz
+        else { if (now - lastRot < 100) return; lastRot = now; }           // ~10 Hz
+        SensorManager.getRotationMatrixFromVector(m, e.values);
+        JSArray a = new JSArray();
+        for (float v : m) a.put((double) v);
+        JSObject d = new JSObject(); d.put("m", a);
+        notifyListeners(isGame ? "game" : "rot", d);
     }
 
-    @Override
-    public void onAccuracyChanged(Sensor sensor, int acc) { accuracy = acc; }
-
-    @Override
-    protected void handleOnPause() { if (sm != null) sm.unregisterListener(this); }
-
-    @Override
-    protected void handleOnResume() {
-        if (sm == null) return;
-        Sensor s = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
-        if (s != null) sm.registerListener(this, s, SensorManager.SENSOR_DELAY_GAME);
-    }
+    @Override public void onAccuracyChanged(Sensor sensor, int acc) {}
+    @Override protected void handleOnPause() { if (sm != null) sm.unregisterListener(this); }
+    @Override protected void handleOnResume() { if (sm != null) register(); }
 }

@@ -112,6 +112,7 @@
   <div class="h"><span>LAYERS</span></div>
   <div class="grid2" id="layers"></div>
   <div class="h" style="margin-top:8px"><span>CALIBRATION</span></div>
+  <label><input id="cmpAssist" type="checkbox" checked> COMPASS BACKUP (PULLS NORTH IF NO ⌖/☀ FIX FOR 2 MIN)</label>
   <label>CMP <input id="off" type="range" min="-30" max="30" step="0.5" value="0"><span id="offv">0°</span></label>
   <label>FOV <input id="fov" type="range" min="35" max="90" step="1" value="63"><span id="fovv">63°</span></label>
   <label>PIT <input id="poff" type="range" min="-10" max="10" step="0.25" value="0"><span id="poffv">0°</span></label>
@@ -389,51 +390,68 @@ function sunEvents(){
 const hhmm=t=>new Date(t).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
 
 // ===== orientation =====
-// Orientation sources, best first: Generic Sensor API (Android) > deviceorientationabsolute > deviceorientation (+iOS compass).
-// All feed applyRot() with the device->world (ENU) rotation matrix entries we need.
-const sens={src:"NONE",n:0,last:0,absAt:0};
-const SRC_RANK={NATIVE:5,SENSOR:4,"ABS-EVT":3,"IOS-CMP":3,"REL-EVT":1};
-function applyRot(r13,r23,r33,r31,r32,src){
-  const now=performance.now();
-  if(SRC_RANK[src]<(SRC_RANK[sens.src]||0)&&now-sens.last<500) return; // a better source is live
-  sens.src=src; sens.n++; sens.last=now;
-  const h=(deg(Math.atan2(-r13,-r23))+360)%360;
-  heading=(heading+wrap(h-heading)*0.2+360)%360;
-  pitch+=(deg(Math.asin(Math.max(-1,Math.min(1,-r33))))-pitch)*0.2;
-  roll+=wrap(deg(Math.atan2(r31,r32))-roll)*0.2;
+// ===== Orientation fusion =====
+//  GYRO  (gyro+accel, no magnetometer): smooth relative motion, drives the display
+//  VISUAL (⌖ skyline / ☀ sun): absolute heading fixes, applied to FU.off
+//  COMPASS: first guess, then only a slow backup pull when no visual fix for 2 min (toggleable)
+// If no gyro stream exists, the compass stream drives the display directly (legacy mode).
+const sens={src:"NONE",n:0,last:0};
+const FU={off:null,gH:0,gameAt:0,compAt:0,lastVis:-1e9,assist:true,compassOnly:false};
+try{FU.assist=localStorage.getItem("cmpAssist")!=="0"}catch(e){}
+$("cmpAssist").checked=FU.assist;
+$("cmpAssist").onchange=e=>{FU.assist=e.target.checked;try{localStorage.setItem("cmpAssist",FU.assist?"1":"0")}catch(_){}};
+const hpr=(r13,r23,r33,r31,r32)=>[(deg(Math.atan2(-r13,-r23))+360)%360,deg(Math.asin(Math.max(-1,Math.min(1,-r33)))),deg(Math.atan2(r31,r32))];
+function setOrient(h,p,r){
+  heading=(heading+wrap(h-heading)*0.25+360)%360; pitch+=(p-pitch)*0.25; roll+=wrap(r-roll)*0.25;
 }
-function onOrient(e,abs){
-  if(e.alpha==null&&e.webkitCompassHeading==null) return;
-  const now=performance.now();
-  if(abs||e.absolute) sens.absAt=now;
-  else if(e.webkitCompassHeading==null&&now-sens.absAt<1000) return; // prefer absolute stream
-  if(e.webkitCompassHeading!=null) iosHeading=e.webkitCompassHeading;
-  let a=e.alpha??0; if(iosHeading!=null) a=360-iosHeading;
-  a=rad(a); const b=rad(e.beta||0),g=rad(e.gamma||0);
-  const ca=Math.cos(a),sa=Math.sin(a),cb=Math.cos(b),sb=Math.sin(b),cg=Math.cos(g),sg=Math.sin(g);
-  applyRot(ca*sg+sa*sb*cg, sa*sg-ca*sb*cg, cb*cg, -cb*sg, sb,
-    iosHeading!=null?"IOS-CMP":(abs||e.absolute)?"ABS-EVT":"REL-EVT");
+function onGyro(r13,r23,r33,r31,r32,src){
+  const now=performance.now(),[h,p,r]=hpr(r13,r23,r33,r31,r32);
+  FU.gH=h; FU.gameAt=now; FU.compassOnly=false;
+  sens.src=src+(FU.off==null?"·NO-N":""); sens.n++; sens.last=now;
+  setOrient(h+(FU.off??0),p,r);
+}
+function onCompass(r13,r23,r33,r31,r32,src){
+  const now=performance.now(),[h,p,r]=hpr(r13,r23,r33,r31,r32); FU.compAt=now;
+  if(now-FU.gameAt>600){ FU.compassOnly=true; sens.src=src; sens.n++; sens.last=now; setOrient(h,p,r); return } // no gyro stream
+  const o=wrap(h-FU.gH);
+  if(FU.off==null) FU.off=o;                                                    // rough first guess
+  else if(FU.assist&&now-FU.lastVis>120000) FU.off+=wrap(o-FU.off)*0.01;        // slow backup pull
+}
+// visual fix: rotate the gyro frame (or the offset in compass-only/no-sensor mode)
+function fixHeading(dh){
+  FU.lastVis=performance.now();
+  if(performance.now()-FU.gameAt<600&&!FU.compassOnly){ FU.off=(FU.off??0)+dh; heading=(heading+dh+360)%360 }
+  else AL.h+=dh;
+}
+const eulerM=(al,be,ga)=>{const a=rad(al),b=rad(be),g=rad(ga),ca=Math.cos(a),sa=Math.sin(a),cb=Math.cos(b),sb=Math.sin(b),cg=Math.cos(g),sg=Math.sin(g);
+  return [ca*sg+sa*sb*cg, sa*sg-ca*sb*cg, cb*cg, -cb*sg, sb]};
+function onOrientEvt(e,absEvt){
+  if(e.alpha==null) return;
+  const nat=performance.now()-sens.last<500&&sens.src.startsWith("NAT"); if(nat) return;
+  if(e.webkitCompassHeading!=null){ // iOS: alpha is relative (gyro), compass heading separate
+    onGyro(...eulerM(e.alpha,e.beta,e.gamma),"IOS-GYR");
+    onCompass(...eulerM(360-e.webkitCompassHeading,e.beta,e.gamma),"IOS-CMP"); return;
+  }
+  if(absEvt||e.absolute) onCompass(...eulerM(e.alpha,e.beta,e.gamma),"ABS-EVT");
+  else onGyro(...eulerM(e.alpha,e.beta,e.gamma),"REL-EVT");
 }
 function startSensors(){
-  // native app (Capacitor): fused rotation-vector sensor straight from Android/iOS
   const C=window.Capacitor;
   if(C?.isNativePlatform?.()){
     const NS=C.registerPlugin("NordSensor");
-    NS.addListener("rot",d=>{const m=d.m;applyRot(m[2],m[5],m[8],m[6],m[7],"NATIVE")});
+    NS.addListener("game",d=>{const m=d.m;onGyro(m[2],m[5],m[8],m[6],m[7],"NAT-GYR")});
+    NS.addListener("rot",d=>{const m=d.m;onCompass(m[2],m[5],m[8],m[6],m[7],"NAT-CMP")});
     NS.start().catch(e=>status("NATIVE SENSOR: "+e.message));
+    return;
   }
-  if("AbsoluteOrientationSensor" in window){
-    try{
-      const s=new AbsoluteOrientationSensor({frequency:30,referenceFrame:"device"});
-      s.onreading=()=>{const [x,y,z,w]=s.quaternion;
-        applyRot(2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y),2*(x*z-w*y),2*(y*z+w*x),"SENSOR")};
-      s.onerror=e=>status("SENSOR API: "+e.error.name);
-      s.start();
-    }catch(e){}
-  }
-  addEventListener("deviceorientationabsolute",e=>onOrient(e,true));
-  addEventListener("deviceorientation",e=>onOrient(e,false));
-  setTimeout(()=>{if(!sens.n) status("NO ORIENTATION DATA · CHROME › SITE SETTINGS › MOTION SENSORS = ALLOW")},3000);
+  const q2m=([x,y,z,w])=>[2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y),2*(x*z-w*y),2*(y*z+w*x)];
+  try{ if("RelativeOrientationSensor" in window){const s=new RelativeOrientationSensor({frequency:30,referenceFrame:"device"});
+    s.onreading=()=>onGyro(...q2m(s.quaternion),"SEN-GYR"); s.start()} }catch(e){}
+  try{ if("AbsoluteOrientationSensor" in window){const s=new AbsoluteOrientationSensor({frequency:10,referenceFrame:"device"});
+    s.onreading=()=>onCompass(...q2m(s.quaternion),"SEN-CMP"); s.start()} }catch(e){}
+  addEventListener("deviceorientationabsolute",e=>onOrientEvt(e,true));
+  addEventListener("deviceorientation",e=>onOrientEvt(e,false));
+  setTimeout(()=>{if(!sens.n) status("NO ORIENTATION DATA · USE ⌖ ALIGN / ☀ SUN · OR ALLOW MOTION SENSORS")},3000);
 }
 
 // ===== ⌖ ALIGN: skyline matching =====
@@ -511,7 +529,7 @@ function runAlign(full){
   const ok=m.c<0.8&&(!full||m.conf>1.35);
   if(!ok){ if(full) status(`ALIGN: AMBIGUOUS (ERR ${m.c.toFixed(2)}° · CONF ${m.conf.toFixed(1)})`); AL.lost++; return false }
   const k=full?1:0.35; // smooth while tracking
-  AL.h+=wrap(m.h-curHead())*k; AL.p+=(m.v-curPit())*k; AL.lost=0;
+  fixHeading(wrap(m.h-curHead())*k); AL.p+=(m.v-curPit())*k; AL.lost=0;
   if(full) status(`ALIGNED · HDG ${m.h.toFixed(1)}° · ERR ${m.c.toFixed(2)}° · CONF ${m.conf.toFixed(1)}`);
   return true;
 }
@@ -551,7 +569,7 @@ $("sunBtn").onclick=()=>{
   const sp=sunPos(Date.now(),pos.lat,pos.lon);
   if(sp.alt<1) return status("SUN CAL: SUN BELOW HORIZON");
   const f=findSunInFrame()||{dx:0,de:0,reticle:true};
-  AL.h+=wrap(sp.az-(curHead()+f.dx)); AL.p+=sp.alt-(curPit()+f.de);
+  fixHeading(wrap(sp.az-(curHead()+f.dx))); AL.p+=sp.alt-(curPit()+f.de);
   status(`SUN CAL ${f.reticle?"(RETICLE)":"(DETECTED)"} · AZ ${sp.az.toFixed(1)}° · EL ${sp.alt.toFixed(1)}° · HDG ${curHead().toFixed(1)}°`);
 };
 
