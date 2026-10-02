@@ -54,7 +54,7 @@ public class NordSensorPlugin extends Plugin implements SensorEventListener {
         else { if (now - lastRot < 100) return; lastRot = now; }           // ~10 Hz
         SensorManager.getRotationMatrixFromVector(m, e.values);
         JSArray a = new JSArray();
-        for (float v : m) a.put((double) v);
+        for (float v : m) a.put(Double.valueOf(v)); // put(Object): no checked JSONException
         JSObject d = new JSObject(); d.put("m", a);
         notifyListeners(isGame ? "game" : "rot", d);
     }
